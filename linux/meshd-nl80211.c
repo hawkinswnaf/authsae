@@ -114,6 +114,8 @@ const char rsn_ie[0x16] = {0x30, /* RSN element ID */
                        0x0, 0x0,             /* Capabilities */
                        };
 
+#define IS_ADHOC 1
+
 /* Undo libnl's error code translation.  See nl_syserr2nlerr */
 static void nl2syserr(int error)
 {
@@ -251,10 +253,16 @@ static void srv_handler_wrapper(int fd, void *data)
 static int tx_frame(struct netlink_config_s *nlcfg, struct mesh_node *mesh,
                     unsigned char *frame, int len)
 {
+    struct ieee80211_mgmt_frame *sframe;
     struct nl_msg *msg;
     uint8_t cmd = NL80211_CMD_FRAME;
     int ret = 0;
     char *pret;
+
+    sframe = (struct ieee80211_mgmt_frame*)frame;
+
+    if (meshd_conf.using_bssid)
+        memcpy(sframe->bssid, meshd_conf.bssid, ETH_ALEN);
 
     sae_debug(MESHD_DEBUG, "%s(%p, %p, %d)\n", __FUNCTION__, nlcfg, frame, len);
     msg = nlmsg_alloc();
@@ -868,10 +876,12 @@ static int set_authenticated_flag(struct netlink_config_s *nlcfg, unsigned char 
 
     NLA_PUT_U32(msg, NL80211_ATTR_IFINDEX, nlcfg->ifindex);
     NLA_PUT(msg, NL80211_ATTR_MAC, ETH_ALEN, peer);
-    flags.mask = flags.set = (1 << NL80211_STA_FLAG_AUTHENTICATED) |
+    if (!IS_ADHOC)
+        flags.mask = flags.set = (1 << NL80211_STA_FLAG_AUTHENTICATED) |
                                 (1 << NL80211_STA_FLAG_MFP) |
                                 (1 << NL80211_STA_FLAG_AUTHORIZED);
-
+    else 
+        flags.mask = flags.set = (1 << NL80211_STA_FLAG_AUTHORIZED);
     NLA_PUT(msg, NL80211_ATTR_STA_FLAGS2, sizeof(flags), &flags);
 
 
@@ -961,6 +971,37 @@ nla_put_failure:
 }
 #endif
 
+#define LEAVE_CMD leave_ibss
+
+static int leave_ibss(struct netlink_config_s *nlcfg)
+{
+    struct nl_msg *msg;
+    uint8_t cmd = NL80211_CMD_LEAVE_IBSS;
+    int ret;
+    char *pret;
+
+    msg = nlmsg_alloc();
+    if (!msg)
+        return -ENOMEM;
+
+    pret = genlmsg_put(msg, 0, 0,
+            genl_family_get_id(nlcfg->nl80211), 0, 0, cmd, 0);
+    if (pret == NULL)
+        goto nla_put_failure;
+    NLA_PUT_U32(msg, NL80211_ATTR_IFINDEX, nlcfg->ifindex);
+
+    /*  Suppress netlink error in case we are not connected to mesh */
+    nlcfg->supress_error = -ENOTCONN;
+    ret = send_nlmsg(nlcfg->nl_sock, msg);
+    if (ret < 0)
+        fprintf(stderr,"IBSS leave failed: %d (%s)\n", ret, strerror(-ret));
+    else
+        ret = 0;
+
+    return ret;
+nla_put_failure:
+    return -ENOBUFS;
+}
 static int leave_mesh(struct netlink_config_s *nlcfg)
 {
     struct nl_msg *msg;
@@ -984,6 +1025,63 @@ static int leave_mesh(struct netlink_config_s *nlcfg)
     ret = send_nlmsg(nlcfg->nl_sock, msg);
     if (ret < 0)
         fprintf(stderr,"Mesh leave failed: %d (%s)\n", ret, strerror(-ret));
+    else
+        ret = 0;
+
+    return ret;
+nla_put_failure:
+    return -ENOBUFS;
+}
+
+#define JOIN_CMD join_ibss
+
+static int join_ibss(struct netlink_config_s *nlcfg, struct meshd_config *mconf)
+{
+    struct nl_msg *msg;
+    uint8_t cmd = NL80211_CMD_JOIN_IBSS;
+    uint8_t basic_rates[MAX_SUPP_RATES];
+    int rates = 0, i;
+    int ret;
+    char *pret;
+
+    assert(rsn_ie[1] == sizeof(rsn_ie) - 2);
+
+    msg = nlmsg_alloc();
+    if (!msg)
+        return -ENOMEM;
+
+    if (!mconf->using_bssid)
+        return -EINVAL;
+
+    sae_debug(MESHD_DEBUG, "meshd: Joining IBSS with bssid id = %s\n", mconf->bssid_string);
+
+    pret = genlmsg_put(msg, 0, 0,
+            genl_family_get_id(nlcfg->nl80211), 0, 0, cmd, 0);
+    if (pret == NULL)
+        goto nla_put_failure;
+
+    /* configure BSSBasicRateSet in kernel MPM, which has to know about this to
+     * select eligible candidates */
+    for (i = 0; i < sizeof(mconf->rates); i++) {
+        if (mconf->rates[i] & 0x80) {
+            basic_rates[rates] = mconf->rates[i];
+            rates++;
+        }
+    }
+
+    sae_hexdump(MESHD_DEBUG, "basic rates:", basic_rates, rates);
+
+    NLA_PUT_U32(msg, NL80211_ATTR_IFINDEX, nlcfg->ifindex);
+    NLA_PUT(msg, NL80211_ATTR_BSS_BASIC_RATES, rates, basic_rates);
+    NLA_PUT_U32(msg, NL80211_ATTR_WIPHY_FREQ, 2437);
+    NLA_PUT_FLAG(msg, NL80211_ATTR_FREQ_FIXED);
+    NLA_PUT(msg, NL80211_ATTR_SSID, mconf->meshid_len, mconf->meshid);
+    NLA_PUT(msg, NL80211_ATTR_MAC, 6, mconf->bssid);
+    NLA_PUT_FLAG(msg, NL80211_ATTR_CONTROL_PORT);
+
+    ret = send_nlmsg(nlcfg->nl_sock, msg);
+    if (ret < 0)
+        fprintf(stderr,"IBSS join failed: %d (%s)\n", ret, strerror(-ret));
     else
         ret = 0;
 
@@ -1153,6 +1251,44 @@ meshd_parse_libconfig (struct config_setting_t *meshd_section,
         config->meshid_len = strlen(config->meshid);
     }
 
+    if (config_setting_lookup_string(meshd_section, "bssid", (const char**)&str)) {
+    	char *str_copy = NULL;
+        char *tok = NULL;
+        unsigned int pos = 0;
+
+        config->using_bssid = 1;
+
+        str_copy = (char*)malloc(sizeof(char)*(strlen(str)+1));
+        memset(str_copy, 0, sizeof(char)*(strlen(str)+1));
+        memcpy(str_copy, str, sizeof(char)*(strlen(str)+1));
+        if (tok = strtok(str_copy, ":"))
+        {
+            do {
+                /* 
+                 * add the tok.
+                 */
+                long unsigned int conversion = 0;
+                unsigned char byte;
+
+                conversion = strtol(tok, NULL, 16);
+                if (conversion > 0xff)
+                {
+                    config->using_bssid = 0;
+                    fprintf(stderr,"Invalid BSSID (%s). Not using one.\n", tok);
+                    break;
+                }
+
+                byte = (unsigned char)conversion;
+                config->bssid[pos++] = byte;
+            } while ((tok = strtok(NULL, ":")) && pos < 6);
+        }
+        if (config->using_bssid)
+        {
+            memcpy(config->bssid_string,str_copy,sizeof(char)*(strlen(str)+1));
+        }
+        free(str_copy);
+    }
+
     config_setting_lookup_int(meshd_section, "passive", (long int *)&config->passive);
     config_setting_lookup_int(meshd_section, "beacon", (long int *)&config->beacon);
     config_setting_lookup_int(meshd_section, "debug", (long int *)&config->debug);
@@ -1233,8 +1369,8 @@ static int init(struct netlink_config_s *nlcfg, struct mesh_node *mesh)
         exit(EXIT_FAILURE);
     }
 
-    leave_mesh(nlcfg);
-    exitcode = join_mesh_rsn(nlcfg, mesh->conf);
+    LEAVE_CMD(nlcfg);
+    exitcode = JOIN_CMD(nlcfg, mesh->conf);
     if (exitcode) {
         fprintf(stderr, "Failed to join mesh\n");
         goto out;
